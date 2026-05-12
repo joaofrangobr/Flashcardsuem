@@ -1,0 +1,14 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Icone Questoes UEM</title>
+  <desc id="desc">Cartoes de estudo com marcadores de prova e estrela central.</desc>
+  <rect width="512" height="512" rx="96" fill="#f8fafc"/>
+  <path d="M96 156c0-28.7 23.3-52 52-52h216c28.7 0 52 23.3 52 52v244c0 11-9 20-20 20H148c-28.7 0-52-23.3-52-52V156z" fill="#2563eb"/>
+  <path d="M132 142c0-17.7 14.3-32 32-32h214c10.5 0 19 8.5 19 19v238c0 10.5-8.5 19-19 19H164c-17.7 0-32-14.3-32-32V142z" fill="#ffffff"/>
+  <path d="M164 110h214c10.5 0 19 8.5 19 19v48H132v-35c0-17.7 14.3-32 32-32z" fill="#14b8a6"/>
+  <path d="M180 229h152" stroke="#0f172a" stroke-width="22" stroke-linecap="round"/>
+  <path d="M180 286h104" stroke="#64748b" stroke-width="22" stroke-linecap="round"/>
+  <path d="M180 343h142" stroke="#64748b" stroke-width="22" stroke-linecap="round"/>
+  <circle cx="357" cy="303" r="62" fill="#f59e0b"/>
+  <path d="M357 260l12.8 26 28.7 4.2-20.8 20.3 4.9 28.6L357 325.6l-25.7 13.5 4.9-28.6-20.8-20.3 28.7-4.2L357 260z" fill="#fff7ed"/>
+  <path d="M121 373c0 17.7 14.3 32 32 32h244" stroke="#0f172a" stroke-width="20" stroke-linecap="round" opacity=".18"/>
+</svg>
