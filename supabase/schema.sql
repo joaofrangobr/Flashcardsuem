@@ -1,4 +1,4 @@
--- Supabase schema inicial para cards-app
+﻿-- Supabase schema inicial para cards-app
 -- Rode este arquivo no SQL editor do Supabase.
 
 create table if not exists public.profiles (
@@ -11,6 +11,21 @@ create table if not exists public.profiles (
 
 alter table public.profiles
 add column if not exists role text not null default 'student';
+
+alter table public.profiles
+add column if not exists avatar_url text;
+
+alter table public.profiles
+add column if not exists last_study_at timestamptz;
+
+alter table public.profiles
+add column if not exists total_correct_count integer not null default 0;
+
+alter table public.profiles
+add column if not exists total_partial_count integer not null default 0;
+
+alter table public.profiles
+add column if not exists total_wrong_count integer not null default 0;
 
 alter table public.profiles
 drop constraint if exists profiles_role_check;
@@ -54,10 +69,14 @@ create table if not exists public.study_results (
   exam text not null,
   discipline text,
   correct_count integer not null default 0,
+  partial_count integer not null default 0,
   wrong_count integer not null default 0,
   total_count integer not null default 0,
   created_at timestamptz not null default now()
 );
+
+alter table public.study_results
+add column if not exists partial_count integer not null default 0;
 
 create table if not exists public.study_attempts (
   id uuid primary key default gen_random_uuid(),
@@ -67,10 +86,14 @@ create table if not exists public.study_attempts (
   total_questions integer not null default 0,
   answered_questions integer not null default 0,
   correct_count integer not null default 0,
+  partial_count integer not null default 0,
   wrong_count integer not null default 0,
   finished_at timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
+
+alter table public.study_attempts
+add column if not exists partial_count integer not null default 0;
 
 create table if not exists public.study_attempt_answers (
   id uuid primary key default gen_random_uuid(),
@@ -84,8 +107,19 @@ create table if not exists public.study_attempt_answers (
   selected_sum integer not null default 0,
   official_answer integer,
   is_correct boolean,
+  result_status text not null default 'pending' check (result_status in ('correct', 'partial', 'wrong', 'pending', 'no_official')),
   created_at timestamptz not null default now()
 );
+
+alter table public.study_attempt_answers
+add column if not exists result_status text not null default 'pending';
+
+alter table public.study_attempt_answers
+drop constraint if exists study_attempt_answers_result_status_check;
+
+alter table public.study_attempt_answers
+add constraint study_attempt_answers_result_status_check
+check (result_status in ('correct', 'partial', 'wrong', 'pending', 'no_official'));
 
 create table if not exists public.study_attempt_disciplines (
   id uuid primary key default gen_random_uuid(),
@@ -96,8 +130,29 @@ create table if not exists public.study_attempt_disciplines (
   total_questions integer not null default 0,
   answered_questions integer not null default 0,
   correct_count integer not null default 0,
+  partial_count integer not null default 0,
   wrong_count integer not null default 0,
   created_at timestamptz not null default now()
+);
+
+alter table public.study_attempt_disciplines
+add column if not exists partial_count integer not null default 0;
+
+create table if not exists public.study_question_progress (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  exam text not null,
+  study_mode text not null check (study_mode in ('pas', 'vestibular')),
+  question_id text not null,
+  question_number integer not null,
+  discipline text,
+  selected_codes text[] not null default '{}',
+  selected_sum integer not null default 0,
+  official_answer integer,
+  result_status text not null check (result_status in ('correct', 'partial', 'wrong', 'no_official')),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (user_id, question_id)
 );
 
 alter table public.profiles enable row level security;
@@ -107,6 +162,7 @@ alter table public.study_results enable row level security;
 alter table public.study_attempts enable row level security;
 alter table public.study_attempt_answers enable row level security;
 alter table public.study_attempt_disciplines enable row level security;
+alter table public.study_question_progress enable row level security;
 
 create or replace function public.current_user_is_admin()
 returns boolean as $$
@@ -141,6 +197,10 @@ drop policy if exists "study_attempt_answers_insert_own" on public.study_attempt
 drop policy if exists "study_attempt_disciplines_select_own" on public.study_attempt_disciplines;
 drop policy if exists "study_attempt_disciplines_select_admin" on public.study_attempt_disciplines;
 drop policy if exists "study_attempt_disciplines_insert_own" on public.study_attempt_disciplines;
+drop policy if exists "study_question_progress_select_own" on public.study_question_progress;
+drop policy if exists "study_question_progress_select_admin" on public.study_question_progress;
+drop policy if exists "study_question_progress_insert_own" on public.study_question_progress;
+drop policy if exists "study_question_progress_update_own" on public.study_question_progress;
 
 create policy "profiles_select_own" on public.profiles for select using (auth.uid() = id);
 create policy "profiles_insert_own" on public.profiles for insert with check (auth.uid() = id);
@@ -166,6 +226,10 @@ create policy "study_attempt_answers_insert_own" on public.study_attempt_answers
 create policy "study_attempt_disciplines_select_own" on public.study_attempt_disciplines for select using (auth.uid() = user_id);
 create policy "study_attempt_disciplines_select_admin" on public.study_attempt_disciplines for select using (public.current_user_is_admin());
 create policy "study_attempt_disciplines_insert_own" on public.study_attempt_disciplines for insert with check (auth.uid() = user_id);
+create policy "study_question_progress_select_own" on public.study_question_progress for select using (auth.uid() = user_id);
+create policy "study_question_progress_select_admin" on public.study_question_progress for select using (public.current_user_is_admin());
+create policy "study_question_progress_insert_own" on public.study_question_progress for insert with check (auth.uid() = user_id);
+create policy "study_question_progress_update_own" on public.study_question_progress for update using (auth.uid() = user_id);
 
 create or replace function public.handle_new_user()
 returns trigger as $$

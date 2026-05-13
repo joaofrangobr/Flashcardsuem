@@ -1,22 +1,23 @@
-"use client";
+﻿"use client";
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { getAccessRole } from "@/lib/access";
-import { supabase } from "@/lib/supabase";
+import { isSupabaseConfigured, supabase } from "@/lib/supabase";
 
 const links = [
   ["Início", "/"],
-  ["Planos", "/pricing"],
+  ["Estudar agora", "/study"],
   ["Entrar", "/login"],
-  ["Área do aluno", "/dashboard"],
-  ["Termos", "/terms"],
+  ["Perfil", "/dashboard"],
 ] as const;
 
 export function Header() {
   const [showAdmin, setShowAdmin] = useState(false);
 
   useEffect(() => {
+    if (!isSupabaseConfigured) return;
+
     let mounted = true;
 
     async function loadUser() {

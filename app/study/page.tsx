@@ -1,9 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { supabase } from "@/lib/supabase";
-import { canAccessPaidContent, getAccessRole, type AccessRole } from "@/lib/access";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { getAccessRole, type AccessRole } from "@/lib/access";
 import {
   StructuredBank,
   StructuredQuestion,
@@ -12,30 +11,42 @@ import {
   normalizePasStructuredBank,
 } from "@/lib/pas-structured";
 import {
+  saveQuestionProgress,
   saveStudyAttempt,
   type AttemptAnswerInput,
+  type AttemptResultStatus,
   type DisciplineResult,
   type StudyMode,
 } from "@/lib/study-history";
+import { isSupabaseConfigured, supabase } from "@/lib/supabase";
 
 const answerCodes = [16, 8, 4, 2, 1];
+const LOCAL_PROGRESS_KEY = "cards-app-progress-v1";
 const mojibakePattern =
-  /ÃƒÆ’|Ãƒâ€š|ÃƒÂ¢Ã¢â€šÂ¬|ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢|ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ|ÃƒÂ¢Ã¢â€šÂ¬\x9d|ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“|ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â/;
+  /ÃƒÆ’Ã†â€™|ÃƒÆ’Ã¢â‚¬Å¡|ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬|ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢|ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“|ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬\x9d|ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ|ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â/;
 
-type AttemptSummary = {
+type StoredQuestionProgress = {
+  questionId: string;
   exam: string;
-  totalQuestions: number;
-  answeredQuestions: number;
-  unansweredQuestions: number;
-  questionsWithoutOfficial: number;
-  correctCount: number;
-  wrongCount: number;
-  disciplines: DisciplineResult[];
-  answers: AttemptAnswerInput[];
-  attemptId?: string;
+  studyMode: StudyMode;
+  status: Exclude<AttemptResultStatus, "pending">;
+  selectedCodes: string[];
+  selectedSum: number;
+  officialAnswer: number | null;
+  updatedAt: string;
 };
 
-type ReviewFilter = "all" | "correct" | "wrong" | "pending" | "noOfficial";
+type ProgressStore = Record<string, StoredQuestionProgress>;
+
+type ExamProgress = {
+  exam: string;
+  totalQuestions: number;
+  studiedCount: number;
+  correctCount: number;
+  partialCount: number;
+  wrongCount: number;
+  hasProgress: boolean;
+};
 
 function splitOfficialAnswer(value?: number | null) {
   if (value === null || value === undefined || value < 0) return [] as string[];
@@ -109,6 +120,72 @@ function isImplicitZeroAnswer(question: StructuredQuestion, selectedCodes: strin
   return question.officialAnswer === 0 && selectedCodes.length === 0;
 }
 
+function getQuestionResultStatus(question: StructuredQuestion, selectedCodes: string[]): AttemptResultStatus {
+  if (question.officialAnswer === null || question.officialAnswer === undefined) {
+    return selectedCodes.length ? "no_official" : "pending";
+  }
+
+  if (question.officialAnswer === 0 && selectedCodes.length === 0) {
+    return "correct";
+  }
+
+  if (!selectedCodes.length) {
+    return "pending";
+  }
+
+  const selectedSum = sumSelectedCodes(selectedCodes);
+  if (selectedSum === question.officialAnswer) {
+    return "correct";
+  }
+
+  const officialCodes = splitOfficialAnswer(question.officialAnswer);
+  const allSelectedAreOfficial = selectedCodes.every((code) => officialCodes.includes(code));
+
+  if (allSelectedAreOfficial) {
+    return "partial";
+  }
+
+  return "wrong";
+}
+
+function loadProgressStore(): ProgressStore {
+  if (typeof window === "undefined") return {};
+
+  try {
+    const raw = window.localStorage.getItem(LOCAL_PROGRESS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as ProgressStore;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveProgressStore(store: ProgressStore) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(LOCAL_PROGRESS_KEY, JSON.stringify(store));
+}
+
+function getStatusMessage(status: AttemptResultStatus, question: StructuredQuestion) {
+  if (status === "correct") {
+    return "Acerto completo. Sua soma bateu com o gabarito oficial desta questão.";
+  }
+
+  if (status === "partial") {
+    return "Acerto parcial. Você marcou apenas parte das assertivas corretas e ainda pode retomar depois.";
+  }
+
+  if (status === "wrong") {
+    return `Resposta incorreta. A soma oficial desta questão é ${question.officialAnswer}.`;
+  }
+
+  if (status === "no_official") {
+    return "Esta questão ainda não tem gabarito oficial ligado ao banco.";
+  }
+
+  return "Marque pelo menos uma assertiva antes de corrigir esta questão.";
+}
+
 function StructuredQuestionBrowser({
   bank,
   selectedExam,
@@ -136,45 +213,126 @@ function StructuredQuestionBrowser({
 }) {
   const [answersByQuestion, setAnswersByQuestion] = useState<Record<string, string[]>>({});
   const [revealedByQuestion, setRevealedByQuestion] = useState<Record<string, boolean>>({});
+  const [progressByQuestion, setProgressByQuestion] = useState<Record<string, StoredQuestionProgress>>({});
   const [savingAttempt, setSavingAttempt] = useState(false);
   const [saveMessage, setSaveMessage] = useState("");
-  const [attemptSummary, setAttemptSummary] = useState<AttemptSummary | null>(null);
-  const [reviewFilter, setReviewFilter] = useState<ReviewFilter>("all");
   const questionViewerRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    setProgressByQuestion(loadProgressStore());
+  }, []);
 
   const questions = useMemo(
     () => bank.questions.filter((question) => question.exam === selectedExam),
     [bank.questions, selectedExam],
   );
 
-  const selectedQuestion =
-    questions.find((question) => question.id === selectedQuestionId) || questions[0];
-
+  const selectedQuestion = questions.find((question) => question.id === selectedQuestionId) || questions[0];
   const selectedCodes = selectedQuestion ? answersByQuestion[selectedQuestion.id] || [] : [];
   const selectedSum = sumSelectedCodes(selectedCodes);
   const officialCodes = selectedQuestion ? splitOfficialAnswer(selectedQuestion.officialAnswer) : [];
+  const currentStatus = selectedQuestion ? getQuestionResultStatus(selectedQuestion, selectedCodes) : "pending";
+  const selectedProgress = selectedQuestion ? progressByQuestion[selectedQuestion.id] : undefined;
   const isRevealed = selectedQuestion ? Boolean(revealedByQuestion[selectedQuestion.id]) : false;
   const isLastQuestion = selectedQuestion
     ? questions.findIndex((question) => question.id === selectedQuestion.id) === questions.length - 1
     : true;
 
-  const isCorrect =
-    selectedQuestion?.officialAnswer !== null && selectedQuestion?.officialAnswer !== undefined
-      ? selectedSum === selectedQuestion.officialAnswer
-      : null;
+  const examProgressList = useMemo<ExamProgress[]>(() => {
+    return bank.exams.map((exam) => {
+      const examQuestions = bank.questions.filter((question) => question.exam === exam);
+      const progressEntries = examQuestions
+        .map((question) => progressByQuestion[question.id])
+        .filter((entry): entry is StoredQuestionProgress => Boolean(entry));
+
+      return {
+        exam,
+        totalQuestions: examQuestions.length,
+        studiedCount: progressEntries.length,
+        correctCount: progressEntries.filter((entry) => entry.status === "correct").length,
+        partialCount: progressEntries.filter((entry) => entry.status === "partial").length,
+        wrongCount: progressEntries.filter((entry) => entry.status === "wrong").length,
+        hasProgress: progressEntries.length > 0,
+      };
+    });
+  }, [bank.exams, bank.questions, progressByQuestion]);
+
+  const activeExamProgress = examProgressList.find((entry) => entry.exam === selectedExam);
+
+  useEffect(() => {
+    if (!questions.length) return;
+
+    if (!questions.some((question) => question.id === selectedQuestionId)) {
+      onSelectQuestionId(questions[0].id);
+    }
+  }, [onSelectQuestionId, questions, selectedQuestionId]);
+
+  function persistLocalProgress(entry: StoredQuestionProgress) {
+    setProgressByQuestion((current) => {
+      const next = { ...current, [entry.questionId]: entry };
+      const mergedStore = { ...loadProgressStore(), [entry.questionId]: entry };
+      saveProgressStore(mergedStore);
+      return next;
+    });
+  }
+
+  async function revealAnswer() {
+    if (!selectedQuestion) return;
+
+    const status = getQuestionResultStatus(selectedQuestion, selectedCodes);
+    setSaveMessage("");
+    setRevealedByQuestion((current) => ({
+      ...current,
+      [selectedQuestion.id]: true,
+    }));
+
+    if (status === "pending") {
+      return;
+    }
+
+    const entry: StoredQuestionProgress = {
+      questionId: selectedQuestion.id,
+      exam: selectedQuestion.exam,
+      studyMode,
+      status,
+      selectedCodes,
+      selectedSum,
+      officialAnswer: selectedQuestion.officialAnswer,
+      updatedAt: new Date().toISOString(),
+    };
+
+    persistLocalProgress(entry);
+
+    if (userId && isSupabaseConfigured) {
+      try {
+        await saveQuestionProgress({
+          userId,
+          exam: selectedQuestion.exam,
+          studyMode,
+          questionId: selectedQuestion.id,
+          questionNumber: selectedQuestion.number,
+          discipline: selectedQuestion.discipline,
+          selectedCodes,
+          selectedSum,
+          officialAnswer: selectedQuestion.officialAnswer,
+          resultStatus: status,
+        });
+        setSaveMessage("Progresso desta questão sincronizado no seu perfil.");
+      } catch {
+        setSaveMessage("O progresso ficou salvo neste aparelho, mas não foi possível sincronizar agora.");
+      }
+    }
+  }
 
   function toggleStatement(code: string) {
     if (!selectedQuestion) return;
 
-    setAttemptSummary(null);
     setSaveMessage("");
     setAnswersByQuestion((current) => {
       const existing = current[selectedQuestion.id] || [];
       const next = existing.includes(code)
         ? existing.filter((value) => value !== code)
-        : [...existing, code].sort(
-            (left, right) => Number.parseInt(left, 10) - Number.parseInt(right, 10),
-          );
+        : [...existing, code].sort((left, right) => Number.parseInt(left, 10) - Number.parseInt(right, 10));
 
       return {
         ...current,
@@ -188,45 +346,18 @@ function StructuredQuestionBrowser({
     }));
   }
 
-  function revealAnswer() {
-    if (!selectedQuestion) return;
-
-    setAttemptSummary(null);
-    setSaveMessage("");
-    setRevealedByQuestion((current) => ({
-      ...current,
-      [selectedQuestion.id]: true,
-    }));
-  }
-
   function clearSelection() {
     if (!selectedQuestion) return;
 
-    setAttemptSummary(null);
     setSaveMessage("");
     setAnswersByQuestion((current) => ({
       ...current,
       [selectedQuestion.id]: [],
     }));
-
     setRevealedByQuestion((current) => ({
       ...current,
       [selectedQuestion.id]: false,
     }));
-  }
-
-  function resetAttempt() {
-    setAnswersByQuestion({});
-    setRevealedByQuestion({});
-    setAttemptSummary(null);
-    setSaveMessage("");
-    setReviewFilter("all");
-    if (questions[0]) {
-      onSelectQuestionId(questions[0].id);
-      window.requestAnimationFrame(() => {
-        questionViewerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-      });
-    }
   }
 
   function goToNextQuestion() {
@@ -247,8 +378,8 @@ function StructuredQuestionBrowser({
     const answerRows: AttemptAnswerInput[] = questions.map((question) => {
       const selected = answersByQuestion[question.id] || [];
       const selectedTotal = sumSelectedCodes(selected);
-      const official = question.officialAnswer;
-      const hasOfficialAnswer = official !== null && official !== undefined;
+      const resultStatus = getQuestionResultStatus(question, selected);
+      const isCorrect = resultStatus === "correct" ? true : question.officialAnswer === null ? null : false;
 
       return {
         questionId: question.id,
@@ -256,8 +387,9 @@ function StructuredQuestionBrowser({
         discipline: question.discipline,
         selectedCodes: selected,
         selectedSum: selectedTotal,
-        officialAnswer: official,
-        isCorrect: hasOfficialAnswer ? selectedTotal === official : null,
+        officialAnswer: question.officialAnswer,
+        isCorrect,
+        resultStatus,
       };
     });
 
@@ -265,12 +397,6 @@ function StructuredQuestionBrowser({
     const answeredRows = answerableRows.filter(
       (row) => row.selectedCodes.length > 0 || row.officialAnswer === 0,
     );
-    const unansweredRows = answerableRows.filter(
-      (row) => row.selectedCodes.length === 0 && row.officialAnswer !== 0,
-    );
-    const correctRows = answeredRows.filter((row) => row.isCorrect === true);
-    const wrongRows = answeredRows.filter((row) => row.officialAnswer !== null && row.isCorrect === false);
-    const rowsWithoutOfficial = answerRows.filter((row) => row.officialAnswer === null);
 
     const byDiscipline = new Map<string, DisciplineResult>();
     for (const row of answerRows) {
@@ -281,26 +407,25 @@ function StructuredQuestionBrowser({
         totalQuestions: 0,
         answeredQuestions: 0,
         correctCount: 0,
+        partialCount: 0,
         wrongCount: 0,
       };
 
       const wasAnswered = row.selectedCodes.length > 0 || row.officialAnswer === 0;
-
       current.totalQuestions += 1;
       if (wasAnswered) current.answeredQuestions += 1;
-      if (row.isCorrect === true) current.correctCount += 1;
-      if (wasAnswered && row.isCorrect === false) current.wrongCount += 1;
-
+      if (row.resultStatus === "correct") current.correctCount += 1;
+      if (row.resultStatus === "partial") current.partialCount += 1;
+      if (row.resultStatus === "wrong") current.wrongCount += 1;
       byDiscipline.set(row.discipline, current);
     }
 
     return {
       totalQuestions: answerableRows.length,
       answeredQuestions: answeredRows.length,
-      unansweredQuestions: unansweredRows.length,
-      questionsWithoutOfficial: rowsWithoutOfficial.length,
-      correctCount: correctRows.length,
-      wrongCount: wrongRows.length,
+      correctCount: answeredRows.filter((row) => row.resultStatus === "correct").length,
+      partialCount: answeredRows.filter((row) => row.resultStatus === "partial").length,
+      wrongCount: answeredRows.filter((row) => row.resultStatus === "wrong").length,
       answers: answerRows,
       disciplines: [...byDiscipline.values()].sort((left, right) =>
         left.discipline.localeCompare(right.discipline, "pt-BR"),
@@ -309,95 +434,40 @@ function StructuredQuestionBrowser({
   }
 
   async function finalizeAttempt() {
-    if (!userId) {
-      setSaveMessage("Entre com sua conta para salvar o histórico deste simulado.");
+    const data = buildAttemptData();
+
+    if (!userId || !isSupabaseConfigured) {
+      setSaveMessage("Seu progresso já ficou salvo neste aparelho. Entre na conta para sincronizar o perfil.");
       return;
     }
 
-    const data = buildAttemptData();
     setSavingAttempt(true);
     setSaveMessage("");
 
     try {
-      const attemptId = await saveStudyAttempt({
+      await saveStudyAttempt({
         userId,
         exam: selectedExam,
         studyMode,
         totalQuestions: data.totalQuestions,
         answeredQuestions: data.answeredQuestions,
         correctCount: data.correctCount,
+        partialCount: data.partialCount,
         wrongCount: data.wrongCount,
         answers: data.answers,
         disciplines: data.disciplines,
       });
 
-      setAttemptSummary({
-        exam: selectedExam,
-        totalQuestions: data.totalQuestions,
-        answeredQuestions: data.answeredQuestions,
-        unansweredQuestions: data.unansweredQuestions,
-        questionsWithoutOfficial: data.questionsWithoutOfficial,
-        correctCount: data.correctCount,
-        wrongCount: data.wrongCount,
-        disciplines: data.disciplines,
-        answers: data.answers,
-        attemptId,
-      });
-      setReviewFilter("all");
-
-      setSaveMessage("Resultado salvo no histórico da conta.");
+      setSaveMessage("Tentativa salva no seu perfil com acertos, parciais e erros.");
     } catch (error) {
-      setSaveMessage(error instanceof Error ? error.message : "Não foi possível salvar o histórico.");
+      setSaveMessage(error instanceof Error ? error.message : "Não foi possível salvar seu perfil agora.");
     } finally {
       setSavingAttempt(false);
     }
   }
 
-  useEffect(() => {
-    if (!questions.length) return;
-
-    if (!questions.some((question) => question.id === selectedQuestionId)) {
-      onSelectQuestionId(questions[0].id);
-    }
-  }, [onSelectQuestionId, questions, selectedQuestionId]);
-
-  const reviewQuestions = useMemo(() => {
-    if (!attemptSummary) return [] as Array<{ question: StructuredQuestion; answer: AttemptAnswerInput }>;
-
-    const answerById = new Map(attemptSummary.answers.map((answer) => [answer.questionId, answer]));
-
-    return questions
-      .map((question) => {
-        const answer = answerById.get(question.id);
-        return answer ? { question, answer } : null;
-      })
-      .filter((entry): entry is { question: StructuredQuestion; answer: AttemptAnswerInput } => Boolean(entry))
-      .filter((entry) => {
-        const wasAnswered = entry.answer.selectedCodes.length > 0 || entry.answer.officialAnswer === 0;
-
-        if (reviewFilter === "all") return true;
-        if (reviewFilter === "correct") return entry.answer.isCorrect === true;
-        if (reviewFilter === "wrong") {
-          return entry.answer.officialAnswer !== null && wasAnswered && entry.answer.isCorrect === false;
-        }
-        if (reviewFilter === "pending") {
-          return entry.answer.officialAnswer !== null && !wasAnswered;
-        }
-        return entry.answer.officialAnswer === null;
-      });
-  }, [attemptSummary, questions, reviewFilter]);
-
-  function openQuestionFromReview(questionId: string) {
-    onSelectQuestionId(questionId);
-    setAttemptSummary(null);
-    setSaveMessage("");
-    window.requestAnimationFrame(() => {
-      questionViewerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
-  }
-
   return (
-    <>
+    <section className="screen-stack">
       <section className="panel">
         <p className="eyebrow">{eyebrow}</p>
         <h2>{title}</h2>
@@ -405,14 +475,7 @@ function StructuredQuestionBrowser({
         <div className="actions">
           <label className="wide-field">
             Prova
-            <select
-              value={selectedExam}
-              onChange={(event) => {
-                setAttemptSummary(null);
-                setSaveMessage("");
-                onSelectExam(event.target.value);
-              }}
-            >
+            <select value={selectedExam} onChange={(event) => onSelectExam(event.target.value)}>
               {bank.exams.map((exam) => (
                 <option key={exam} value={exam}>
                   {exam}
@@ -425,256 +488,54 @@ function StructuredQuestionBrowser({
             <span>questões nesta prova</span>
           </div>
           <div className="library-stat">
-            <strong>{bank.questions.length}</strong>
-            <span>questões no acervo</span>
+            <strong>{activeExamProgress?.studiedCount || 0}</strong>
+            <span>questões já revisitadas</span>
           </div>
+          <div className="library-stat">
+            <strong>{activeExamProgress?.correctCount || 0}</strong>
+            <span>acertos completos</span>
+          </div>
+        </div>
+
+        <div className="exam-progress-grid">
+          {examProgressList.map((entry) => {
+            const cardClassName = [
+              "exam-progress-card",
+              selectedExam === entry.exam ? "active" : "",
+              entry.hasProgress ? "studied" : "",
+            ]
+              .filter(Boolean)
+              .join(" ");
+
+            return (
+              <button
+                key={entry.exam}
+                type="button"
+                className={cardClassName}
+                onClick={() => onSelectExam(entry.exam)}
+              >
+                <strong>{entry.exam}</strong>
+                <span>{entry.hasProgress ? `${entry.studiedCount} questão(ões) já estudadas` : "Ainda não iniciada"}</span>
+              </button>
+            );
+          })}
         </div>
       </section>
 
-      {attemptSummary ? (
-        <section className="screen-stack">
-          <section className="panel result-hero">
-            <p className="eyebrow">Resultado final</p>
-            <h2>{attemptSummary.exam}</h2>
-            <p className="section-copy">
-              Seu simulado foi finalizado e salvo no histórico. Agora ficou mais claro revisar o
-              que entrou bem, o que ficou pendente e o que ainda precisa de reforço.
-            </p>
-            <div className="cards-grid cards-grid-3">
-              <article className="panel stat">
-                <span>Aproveitamento</span>
-                <strong>
-                  {attemptSummary.totalQuestions > 0
-                    ? Math.round((attemptSummary.correctCount / attemptSummary.totalQuestions) * 100)
-                    : 0}
-                  %
-                </strong>
-              </article>
-              <article className="panel stat">
-                <span>Acertos</span>
-                <strong>{attemptSummary.correctCount}</strong>
-              </article>
-              <article className="panel stat">
-                <span>Erros</span>
-                <strong>{attemptSummary.wrongCount}</strong>
-              </article>
-            </div>
-            <div className="cards-grid cards-grid-3">
-              <article className="panel stat">
-                <span>Questões com gabarito</span>
-                <strong>{attemptSummary.totalQuestions}</strong>
-              </article>
-              <article className="panel stat">
-                <span>Respondidas</span>
-                <strong>{attemptSummary.answeredQuestions}</strong>
-              </article>
-              <article className="panel stat">
-                <span>Pendentes</span>
-                <strong>{attemptSummary.unansweredQuestions}</strong>
-              </article>
-            </div>
-            {attemptSummary.questionsWithoutOfficial > 0 && (
-              <p className="notice">
-                {attemptSummary.questionsWithoutOfficial} questão(ões) desta prova ainda estão sem
-                gabarito oficial ligado no banco e, por isso, não entram na nota.
-              </p>
-            )}
-            <div className="actions">
-              <button type="button" className="button" onClick={resetAttempt}>
-                Refazer simulado
-              </button>
-              <Link className="button secondary" href="/dashboard">
-                Ver histórico na área do aluno
-              </Link>
-            </div>
-            {saveMessage && <p className="notice">{saveMessage}</p>}
-          </section>
-
-          <section className="panel">
-            <p className="eyebrow">Desempenho</p>
-            <h2>Por disciplina</h2>
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Disciplina</th>
-                    <th>Respondidas</th>
-                    <th>Acertos</th>
-                    <th>Erros</th>
-                    <th>Aproveitamento</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {attemptSummary.disciplines.map((discipline) => {
-                    const rate =
-                      discipline.totalQuestions > 0
-                        ? Math.round((discipline.correctCount / discipline.totalQuestions) * 100)
-                        : 0;
-
-                    return (
-                      <tr key={`${attemptSummary.exam}-${discipline.discipline}`}>
-                        <td>{discipline.discipline}</td>
-                        <td>
-                          {discipline.answeredQuestions}/{discipline.totalQuestions}
-                        </td>
-                        <td>{discipline.correctCount}</td>
-                        <td>{discipline.wrongCount}</td>
-                        <td>{rate}%</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </section>
-
-          <section className="panel">
-            <p className="eyebrow">Revisão</p>
-            <h2>Questão por questão</h2>
-            <div className="actions review-filters">
-              <button
-                type="button"
-                className={reviewFilter === "all" ? "button" : "button secondary"}
-                onClick={() => setReviewFilter("all")}
-              >
-                Todas
-              </button>
-              <button
-                type="button"
-                className={reviewFilter === "correct" ? "button" : "button secondary"}
-                onClick={() => setReviewFilter("correct")}
-              >
-                Acertos
-              </button>
-              <button
-                type="button"
-                className={reviewFilter === "wrong" ? "button" : "button secondary"}
-                onClick={() => setReviewFilter("wrong")}
-              >
-                Erros
-              </button>
-              <button
-                type="button"
-                className={reviewFilter === "pending" ? "button" : "button secondary"}
-                onClick={() => setReviewFilter("pending")}
-              >
-                Pendentes
-              </button>
-              <button
-                type="button"
-                className={reviewFilter === "noOfficial" ? "button" : "button secondary"}
-                onClick={() => setReviewFilter("noOfficial")}
-              >
-                Sem gabarito
-              </button>
-            </div>
-            <div className="result-review-list">
-              {reviewQuestions
-                .slice()
-                .sort((left, right) => left.answer.questionNumber - right.answer.questionNumber)
-                .map(({ question, answer }) => {
-                  const officialAnswerCodes = splitOfficialAnswer(answer.officialAnswer);
-                  const wasAnswered = answer.selectedCodes.length > 0 || answer.officialAnswer === 0;
-
-                  const statusClass =
-                    answer.officialAnswer === null
-                      ? "review-card pending"
-                      : !wasAnswered
-                        ? "review-card pending"
-                        : answer.isCorrect === true
-                          ? "review-card correct"
-                          : "review-card wrong";
-
-                  const statusLabel =
-                    answer.officialAnswer === null
-                      ? "Sem gabarito"
-                      : !wasAnswered
-                        ? "Pendente"
-                        : answer.isCorrect === true
-                          ? "Acerto"
-                          : "Erro";
-
-                  const statusPillClass =
-                    answer.officialAnswer === null
-                      ? "review-status pending"
-                      : !wasAnswered
-                        ? "review-status pending"
-                        : answer.isCorrect === true
-                          ? "review-status correct"
-                          : "review-status wrong";
-
-                  return (
-                    <article className={statusClass} key={`${attemptSummary.exam}-${answer.questionId}`}>
-                      <div className="review-card-head">
-                        <div className="review-card-title">
-                          <strong>Questão {String(answer.questionNumber).padStart(2, "0")}</strong>
-                          <span>{answer.discipline}</span>
-                        </div>
-                        <span className={statusPillClass}>{statusLabel}</span>
-                      </div>
-                      {question.supportText && (
-                        <div className="review-support">
-                          <p className="eyebrow">Texto de apoio</p>
-                          {question.supportTitle && <strong>{question.supportTitle}</strong>}
-                          <p>{question.supportText}</p>
-                        </div>
-                      )}
-                      <div className="answer-chips">
-                        <span className="answer-chip">
-                          Sua soma: {wasAnswered ? answer.selectedSum : "não respondida"}
-                        </span>
-                        <span className="answer-chip">
-                          Gabarito: {answer.officialAnswer ?? "pendente"}
-                        </span>
-                        {answer.selectedCodes.map((code) => (
-                          <span className="answer-chip" key={`${answer.questionId}-selected-${code}`}>
-                            {code}
-                          </span>
-                        ))}
-                        {officialAnswerCodes.map((code) => (
-                          <span className="answer-chip" key={`${answer.questionId}-official-${code}`}>
-                            oficial {code}
-                          </span>
-                        ))}
-                      </div>
-                      <div className="actions compact-actions">
-                        <button
-                          type="button"
-                          className="button secondary"
-                          onClick={() => openQuestionFromReview(question.id)}
-                        >
-                          Abrir esta questão
-                        </button>
-                      </div>
-                    </article>
-                  );
-                })}
-            </div>
-          </section>
-        </section>
-      ) : selectedQuestion ? (
+      {selectedQuestion ? (
         <section className="question-browser">
           <aside className="panel question-list-panel">
             <p className="eyebrow">Questões</p>
             <div className="question-pills">
               {questions.map((question) => {
-                const answeredCodes = answersByQuestion[question.id] || [];
-                const wasRevealed = Boolean(revealedByQuestion[question.id]);
-                const answeredSum = sumSelectedCodes(answeredCodes);
-                const wasAnswered = answeredCodes.length > 0 || isImplicitZeroAnswer(question, answeredCodes);
-                const answeredCorrectly =
-                  wasRevealed &&
-                  question.officialAnswer !== null &&
-                  question.officialAnswer !== undefined &&
-                  answeredSum === question.officialAnswer;
-
+                const storedProgress = progressByQuestion[question.id];
                 const pillClassName = [
                   "question-pill",
                   selectedQuestionId === question.id ? "active" : "",
-                  wasAnswered ? "answered" : "",
-                  wasRevealed ? "revealed" : "",
-                  answeredCorrectly ? "correct" : "",
-                  wasRevealed && wasAnswered && !answeredCorrectly && question.officialAnswer !== null ? "wrong" : "",
+                  storedProgress ? "answered" : "",
+                  storedProgress?.status === "correct" ? "correct" : "",
+                  storedProgress?.status === "partial" ? "partial" : "",
+                  storedProgress?.status === "wrong" ? "wrong" : "",
                 ]
                   .filter(Boolean)
                   .join(" ");
@@ -690,6 +551,11 @@ function StructuredQuestionBrowser({
                 );
               })}
             </div>
+            <div className="study-status-legend">
+              <span className="legend-chip legend-green">Verde: acerto completo</span>
+              <span className="legend-chip legend-orange">Laranja: acerto parcial</span>
+              <span className="legend-chip legend-red">Vermelho: retomar</span>
+            </div>
           </aside>
 
           <article className="panel question-viewer" ref={questionViewerRef}>
@@ -702,9 +568,7 @@ function StructuredQuestionBrowser({
               <section className="support-block">
                 <p className="eyebrow">Texto de apoio</p>
                 {selectedQuestion.supportTitle && <h3>{selectedQuestion.supportTitle}</h3>}
-                {selectedQuestion.supportRange && (
-                  <p className="support-range">Faixa: {selectedQuestion.supportRange}</p>
-                )}
+                {selectedQuestion.supportRange && <p className="support-range">Faixa: {selectedQuestion.supportRange}</p>}
                 <p>{selectedQuestion.supportText}</p>
               </section>
             )}
@@ -751,7 +615,20 @@ function StructuredQuestionBrowser({
                   ) : (
                     <span className="answer-chip muted-chip">Nenhum item marcado</span>
                   )}
+                  {selectedProgress && (
+                    <span className={`answer-chip progress-chip progress-${selectedProgress.status}`}>
+                      Último resultado:{" "}
+                      {selectedProgress.status === "correct"
+                        ? "completo"
+                        : selectedProgress.status === "partial"
+                          ? "parcial"
+                          : selectedProgress.status === "wrong"
+                            ? "erro"
+                            : "sem gabarito"}
+                    </span>
+                  )}
                 </div>
+
                 <div className="actions compact-actions">
                   <button type="button" className="button" onClick={revealAnswer}>
                     Corrigir questão
@@ -759,31 +636,26 @@ function StructuredQuestionBrowser({
                   <button type="button" className="button secondary" onClick={clearSelection}>
                     Limpar marcação
                   </button>
-                  <button
-                    type="button"
-                    className="button secondary"
-                    onClick={goToNextQuestion}
-                    disabled={isLastQuestion}
-                  >
+                  <button type="button" className="button secondary" onClick={goToNextQuestion} disabled={isLastQuestion}>
                     Próxima questão
                   </button>
-                  <button
-                    type="button"
-                    className="button secondary"
-                    onClick={finalizeAttempt}
-                    disabled={savingAttempt}
-                  >
-                    {savingAttempt ? "Salvando..." : "Finalizar simulado"}
+                  <button type="button" className="button secondary" onClick={finalizeAttempt} disabled={savingAttempt}>
+                    {savingAttempt ? "Salvando..." : "Salvar no perfil"}
                   </button>
                 </div>
-                {saveMessage && !attemptSummary && <p className="notice">{saveMessage}</p>}
+
+                {saveMessage && <p className="notice">{saveMessage}</p>}
                 {isRevealed && (
-                  <p className={isCorrect ? "notice success-notice" : "notice error-notice"}>
-                    {isCorrect
-                      ? "Boa. Sua soma bateu com o gabarito oficial desta questão."
-                      : selectedQuestion.officialAnswer === null
-                        ? "Esta questão ainda está sem gabarito oficial ligado no banco."
-                        : `Ainda não foi desta vez. A soma oficial desta questão é ${selectedQuestion.officialAnswer}.`}
+                  <p
+                    className={
+                      currentStatus === "correct"
+                        ? "notice success-notice"
+                        : currentStatus === "partial"
+                          ? "notice partial-notice"
+                          : "notice error-notice"
+                    }
+                  >
+                    {getStatusMessage(currentStatus, selectedQuestion)}
                   </p>
                 )}
               </section>
@@ -792,14 +664,12 @@ function StructuredQuestionBrowser({
             <section className="answer-block">
               <p className="eyebrow">Gabarito oficial</p>
               {!isRevealed ? (
-                <p className="notice">Finalize a questão para liberar o gabarito oficial.</p>
+                <p className="notice">Corrija a questão para liberar o gabarito oficial.</p>
               ) : selectedQuestion.officialAnswer !== null ? (
                 <>
                   <div className="answer-chips">
                     <span className="answer-chip">
-                      {selectedQuestion.officialAnswer === 0
-                        ? "Questão com soma zero"
-                        : `Soma: ${selectedQuestion.officialAnswer}`}
+                      {selectedQuestion.officialAnswer === 0 ? "Questão com soma zero" : `Soma: ${selectedQuestion.officialAnswer}`}
                     </span>
                     {splitOfficialAnswer(selectedQuestion.officialAnswer).map((code) => (
                       <span className="answer-chip" key={`${selectedQuestion.id}-${code}`}>
@@ -808,17 +678,10 @@ function StructuredQuestionBrowser({
                     ))}
                   </div>
                   {selectedQuestion.officialAnswer === 0 && (
-                    <p className="notice">
-                      Nesta questão, deixar todos os itens desmarcados conta como resposta correta.
-                    </p>
+                    <p className="notice">Nesta questão, deixar todos os itens desmarcados conta como resposta correta.</p>
                   )}
                   {isAdmin && selectedQuestion.officialAnswerSource && (
-                    <a
-                      className="button secondary"
-                      href={selectedQuestion.officialAnswerSource}
-                      target="_blank"
-                      rel="noreferrer noopener"
-                    >
+                    <a className="button secondary" href={selectedQuestion.officialAnswerSource} target="_blank" rel="noreferrer noopener">
                       Fonte do gabarito
                     </a>
                   )}
@@ -829,21 +692,11 @@ function StructuredQuestionBrowser({
 
               {isAdmin && selectedQuestion.pdfUrl && (
                 <div className="actions compact-actions">
-                  <a
-                    className="button secondary"
-                    href={selectedQuestion.pdfUrl}
-                    target="_blank"
-                    rel="noreferrer noopener"
-                  >
+                  <a className="button secondary" href={selectedQuestion.pdfUrl} target="_blank" rel="noreferrer noopener">
                     Abrir PDF desta prova
                   </a>
                   {selectedQuestion.sourceUrl && (
-                    <a
-                      className="button secondary"
-                      href={selectedQuestion.sourceUrl}
-                      target="_blank"
-                      rel="noreferrer noopener"
-                    >
+                    <a className="button secondary" href={selectedQuestion.sourceUrl} target="_blank" rel="noreferrer noopener">
                       Fonte oficial
                     </a>
                   )}
@@ -853,16 +706,14 @@ function StructuredQuestionBrowser({
           </article>
         </section>
       ) : null}
-    </>
+    </section>
   );
 }
 
 export default function StudyPage() {
-  const [allowed, setAllowed] = useState(false);
-  const [loading, setLoading] = useState(true);
   const [role, setRole] = useState<AccessRole>("student");
   const [userId, setUserId] = useState("");
-  const [mode, setMode] = useState<StudyMode>("pas");
+  const [mode, setMode] = useState<StudyMode>("vestibular");
 
   const [legacyBank, setLegacyBank] = useState<StructuredBank | null>(null);
   const [legacyError, setLegacyError] = useState("");
@@ -875,35 +726,19 @@ export default function StudyPage() {
   const [selectedPasQuestionId, setSelectedPasQuestionId] = useState("");
 
   useEffect(() => {
-    async function load() {
+    if (!isSupabaseConfigured) return;
+
+    async function loadUser() {
       const { data: userData } = await supabase.auth.getUser();
       const user = userData.user;
-
-      if (!user) {
-        setLoading(false);
-        return;
-      }
+      if (!user) return;
 
       setUserId(user.id);
-
-      const [{ data: subscriptionData }, { data: profileData }] = await Promise.all([
-        supabase
-          .from("subscriptions")
-          .select("status,ends_at")
-          .eq("user_id", user.id)
-          .order("created_at", { ascending: false })
-          .limit(1)
-          .maybeSingle(),
-        supabase.from("profiles").select("role").eq("id", user.id).maybeSingle(),
-      ]);
-
-      const nextRole = getAccessRole(user.email, profileData?.role);
-      setRole(nextRole);
-      setAllowed(canAccessPaidContent(nextRole, subscriptionData));
-      setLoading(false);
+      const { data: profileData } = await supabase.from("profiles").select("role").eq("id", user.id).maybeSingle();
+      setRole(getAccessRole(user.email, profileData?.role));
     }
 
-    load();
+    loadUser();
   }, []);
 
   useEffect(() => {
@@ -916,14 +751,11 @@ export default function StudyPage() {
 
         const data = normalizeBank((await response.json()) as StructuredBank);
         setLegacyBank(data);
-
         const preferredExam = data.exams.includes("Vestibular UEM 2025 Verão")
           ? "Vestibular UEM 2025 Verão"
-          : data.exams[data.exams.length - 1];
-        const normalizedExam = preferredExam || data.exams[0] || "";
-
-        setSelectedLegacyExam(normalizedExam);
-        const firstQuestion = data.questions.find((question) => question.exam === normalizedExam);
+          : data.exams[data.exams.length - 1] || data.exams[0] || "";
+        setSelectedLegacyExam(preferredExam);
+        const firstQuestion = data.questions.find((question) => question.exam === preferredExam);
         setSelectedLegacyQuestionId(firstQuestion?.id || "");
       } catch (error) {
         setLegacyError(error instanceof Error ? error.message : "Erro ao carregar o banco antigo.");
@@ -943,14 +775,11 @@ export default function StudyPage() {
 
         const data = normalizePasStructuredBank(normalizeBank((await response.json()) as StructuredBank));
         setPasStructuredBank(data);
-
         const preferredExam = data.exams.includes("PAS-UEM 2025 Etapa 1")
           ? "PAS-UEM 2025 Etapa 1"
-          : data.exams[data.exams.length - 1];
-        const normalizedExam = preferredExam || data.exams[0] || "";
-
-        setSelectedPasExam(normalizedExam);
-        const firstQuestion = data.questions.find((question) => question.exam === normalizedExam);
+          : data.exams[data.exams.length - 1] || data.exams[0] || "";
+        setSelectedPasExam(preferredExam);
+        const firstQuestion = data.questions.find((question) => question.exam === preferredExam);
         setSelectedPasQuestionId(firstQuestion?.id || "");
       } catch (error) {
         setPasStructuredError(
@@ -962,76 +791,45 @@ export default function StudyPage() {
     loadPasStructuredBank();
   }, [mode, pasStructuredBank]);
 
-  if (loading) {
-    return (
-      <section className="panel">
-        <p>Verificando assinatura...</p>
-      </section>
-    );
-  }
-
-  if (!allowed) {
-    return (
-      <section className="panel">
-        <p className="eyebrow">Acesso protegido</p>
-        <h1>Ative um plano para acessar o banco completo.</h1>
-        <p className="section-copy">
-          O banco de questões completo deve ficar no Supabase ou em uma API protegida, não em
-          arquivo público.
-        </p>
-        <div className="actions">
-          <Link className="button" href="/pricing">
-            Ver planos
-          </Link>
-          <Link className="button secondary" href="/login">
-            Entrar
-          </Link>
-        </div>
-      </section>
-    );
-  }
-
   return (
     <section className="screen-stack">
       <section className="panel">
-        <p className="eyebrow">Simulados</p>
-        <h1>Biblioteca de estudo UEM</h1>
+        <p className="eyebrow">Estudo livre</p>
+        <h1>Abra o link e já comece a estudar.</h1>
         <p className="section-copy">
-          Agora o cards-app junta dois acervos: vestibulares antigos já estruturados e PAS em
-          formato estruturado. O site do aluno fica focado nas questões; os PDFs oficiais ficam
-          restritos ao acesso admin para conferência.
+          Agora o aluno já pode entrar direto na biblioteca. Sem login, o progresso fica salvo neste aparelho.
+          Com login, o perfil também sincroniza no Supabase.
         </p>
-        <div className="mode-switch">
+        <div className="actions">
+          <button className={mode === "vestibular" ? "button" : "button secondary"} onClick={() => setMode("vestibular")}>
+            Vestibulares antigos
+          </button>
           <button className={mode === "pas" ? "button" : "button secondary"} onClick={() => setMode("pas")}>
             PAS
           </button>
-          <button
-            className={mode === "vestibular" ? "button" : "button secondary"}
-            onClick={() => setMode("vestibular")}
-          >
-            Vestibulares antigos
-          </button>
+          <Link className="button secondary" href="/login">
+            Entrar para salvar perfil
+          </Link>
         </div>
+        <div className="study-status-legend study-entry-legend">
+          <span className="legend-chip legend-green">Verde: acerto completo</span>
+          <span className="legend-chip legend-orange">Laranja: acerto parcial</span>
+          <span className="legend-chip legend-red">Vermelho: revisar depois</span>
+        </div>
+        {userId ? (
+          <p className="notice">Seu perfil está conectado. O progresso pode ser sincronizado questão por questão.</p>
+        ) : (
+          <p className="notice">Você já pode estudar sem conta. Se fizer login, o histórico também ficará salvo no seu perfil.</p>
+        )}
       </section>
 
       {mode === "pas" && (
         <>
-          <section className="panel">
-            <p className="eyebrow">PAS-UEM</p>
-            <h2>Questões estruturadas</h2>
-            <p className="section-copy">
-              O PAS aparece em uma trilha curada por prova, sem abrir PDF na área do aluno. Onde o
-              gabarito oficial já foi importado, ele aparece questão por questão.
-            </p>
-            {role === "admin" && (
-              <p className="notice">
-                Modo admin ativo: os botões de PDF e da fonte oficial aparecem dentro da questão
-                para conferência técnica.
-              </p>
-            )}
-            {pasStructuredError && <p className="notice">{pasStructuredError}</p>}
-          </section>
-
+          {pasStructuredError && (
+            <section className="panel">
+              <p className="notice">{pasStructuredError}</p>
+            </section>
+          )}
           {pasStructuredBank && (
             <StructuredQuestionBrowser
               bank={pasStructuredBank}
@@ -1041,7 +839,7 @@ export default function StudyPage() {
               onSelectQuestionId={setSelectedPasQuestionId}
               eyebrow="Banco PAS"
               title="Questões estruturadas do PAS"
-              description="A versão do aluno usa uma seleção técnica das variantes do PAS para manter a leitura limpa e consistente com o banco antigo de vestibulares."
+              description="Escolha uma prova, resolva as assertivas e deixe o próprio sistema marcar seu progresso para retomada futura."
               isAdmin={role === "admin"}
               studyMode="pas"
               userId={userId}
@@ -1066,7 +864,7 @@ export default function StudyPage() {
               onSelectQuestionId={setSelectedLegacyQuestionId}
               eyebrow="Banco antigo"
               title="Questões estruturadas dos vestibulares"
-              description="Acervo migrado do question-bank.js antigo, com enunciado, itens, gabarito oficial e texto de apoio quando existir."
+              description="O vestibular fica aberto desde o primeiro acesso. O que você acertar completo fica verde, parcial fica laranja e erro fica vermelho para retomar."
               isAdmin={role === "admin"}
               studyMode="vestibular"
               userId={userId}

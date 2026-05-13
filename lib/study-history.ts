@@ -1,6 +1,7 @@
-import { supabase } from "@/lib/supabase";
+﻿import { supabase } from "@/lib/supabase";
 
 export type StudyMode = "pas" | "vestibular";
+export type AttemptResultStatus = "correct" | "partial" | "wrong" | "pending" | "no_official";
 
 export type AttemptAnswerInput = {
   questionId: string;
@@ -10,6 +11,7 @@ export type AttemptAnswerInput = {
   selectedSum: number;
   officialAnswer: number | null;
   isCorrect: boolean | null;
+  resultStatus: AttemptResultStatus;
 };
 
 export type DisciplineResult = {
@@ -17,6 +19,7 @@ export type DisciplineResult = {
   totalQuestions: number;
   answeredQuestions: number;
   correctCount: number;
+  partialCount: number;
   wrongCount: number;
 };
 
@@ -27,9 +30,23 @@ export type AttemptSummaryInput = {
   totalQuestions: number;
   answeredQuestions: number;
   correctCount: number;
+  partialCount: number;
   wrongCount: number;
   answers: AttemptAnswerInput[];
   disciplines: DisciplineResult[];
+};
+
+export type QuestionProgressInput = {
+  userId: string;
+  exam: string;
+  studyMode: StudyMode;
+  questionId: string;
+  questionNumber: number;
+  discipline: string;
+  selectedCodes: string[];
+  selectedSum: number;
+  officialAnswer: number | null;
+  resultStatus: Exclude<AttemptResultStatus, "pending">;
 };
 
 export async function saveStudyAttempt(summary: AttemptSummaryInput) {
@@ -42,6 +59,7 @@ export async function saveStudyAttempt(summary: AttemptSummaryInput) {
       total_questions: summary.totalQuestions,
       answered_questions: summary.answeredQuestions,
       correct_count: summary.correctCount,
+      partial_count: summary.partialCount,
       wrong_count: summary.wrongCount,
       finished_at: new Date().toISOString(),
     })
@@ -65,6 +83,7 @@ export async function saveStudyAttempt(summary: AttemptSummaryInput) {
         selected_sum: answer.selectedSum,
         official_answer: answer.officialAnswer,
         is_correct: answer.isCorrect,
+        result_status: answer.resultStatus,
       })),
     );
 
@@ -81,6 +100,7 @@ export async function saveStudyAttempt(summary: AttemptSummaryInput) {
         total_questions: discipline.totalQuestions,
         answered_questions: discipline.answeredQuestions,
         correct_count: discipline.correctCount,
+        partial_count: discipline.partialCount,
         wrong_count: discipline.wrongCount,
       })),
     );
@@ -93,6 +113,7 @@ export async function saveStudyAttempt(summary: AttemptSummaryInput) {
     exam: summary.exam,
     discipline: "Geral",
     correct_count: summary.correctCount,
+    partial_count: summary.partialCount,
     wrong_count: summary.wrongCount,
     total_count: summary.totalQuestions,
   });
@@ -100,4 +121,25 @@ export async function saveStudyAttempt(summary: AttemptSummaryInput) {
   if (legacyError) throw legacyError;
 
   return attemptId;
+}
+
+export async function saveQuestionProgress(progress: QuestionProgressInput) {
+  const { error } = await supabase.from("study_question_progress").upsert(
+    {
+      user_id: progress.userId,
+      exam: progress.exam,
+      study_mode: progress.studyMode,
+      question_id: progress.questionId,
+      question_number: progress.questionNumber,
+      discipline: progress.discipline,
+      selected_codes: progress.selectedCodes,
+      selected_sum: progress.selectedSum,
+      official_answer: progress.officialAnswer,
+      result_status: progress.resultStatus,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "user_id,question_id" },
+  );
+
+  if (error) throw error;
 }
